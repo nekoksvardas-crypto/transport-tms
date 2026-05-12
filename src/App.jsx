@@ -1,4 +1,7 @@
 import { useState, useEffect } from "react"
+import { supabase } from "./supabase"
+import L from "leaflet"
+
 import {
   Truck, Map, Users, Package, AlertTriangle, Route, Search, Clock, Plus,
   Save, Trash2, Circle, Box, Coffee, Bed, CheckCircle, LocateFixed
@@ -11,8 +14,10 @@ import {
 import "leaflet/dist/leaflet.css"
 import "./App.css"
 
+const COLORS = ["#2563eb", "#16a34a", "#f97316", "#7c3aed", "#dc2626", "#0891b2"]
+
 function formatHours(hours) {
-  const totalMinutes = Math.round(hours * 60)
+  const totalMinutes = Math.round(Number(hours || 0) * 60)
   const h = Math.floor(totalMinutes / 60)
   const m = totalMinutes % 60
   return `${h}h ${m}min`
@@ -30,6 +35,8 @@ function calculateJourneyWithBreaks(drivingHours) {
   let drivenSinceBreak = 0
   let breaks = 0
   let rests = 0
+  let breakSchedule = []
+  let elapsed = 0
 
   while (remaining > 0) {
     const driveChunk = Math.min(
@@ -41,6 +48,7 @@ function calculateJourneyWithBreaks(drivingHours) {
     if (driveChunk > 0) {
       remaining -= driveChunk
       total += driveChunk
+      elapsed += driveChunk
       drivenToday += driveChunk
       drivenSinceBreak += driveChunk
     }
@@ -48,21 +56,37 @@ function calculateJourneyWithBreaks(drivingHours) {
     if (remaining <= 0) break
 
     if (drivenToday >= dailyDriveLimit) {
-      total += dailyRest
       rests += 1
+      breakSchedule.push({
+        type: "Daily rest",
+        after: elapsed,
+        duration: dailyRest,
+        text: `Daily rest after ${formatHours(elapsed)} work time`,
+      })
+
+      total += dailyRest
+      elapsed += dailyRest
       drivenToday = 0
       drivenSinceBreak = 0
       continue
     }
 
     if (drivenSinceBreak >= breakEvery) {
-      total += breakDuration
       breaks += 1
+      breakSchedule.push({
+        type: "Break",
+        after: elapsed,
+        duration: breakDuration,
+        text: `45 min break after ${formatHours(elapsed)}`,
+      })
+
+      total += breakDuration
+      elapsed += breakDuration
       drivenSinceBreak = 0
     }
   }
 
-  return { total, breaks, rests }
+  return { total, breaks, rests, breakSchedule }
 }
 
 function parseCoordinates(input) {
@@ -71,56 +95,144 @@ function parseCoordinates(input) {
   return { lat: parseFloat(match[1]), lon: parseFloat(match[3]) }
 }
 
-function RealMap({ routePoints, plannedMarker }) {
+function getProgressPoint(points, load) {
+  if (!points || points.length === 0) return null
+  if (!load.startTime || !load.totalJourneyHours) return points[0]
+
+  const start = new Date(load.startTime)
+  const now = new Date()
+  const totalMs = Number(load.totalJourneyHours) * 60 * 60 * 1000
+  const passedMs = now - start
+
+  let progress = passedMs / totalMs
+  if (progress < 0) progress = 0
+  if (progress > 1) progress = 1
+
+  const index = Math.floor(progress * (points.length - 1))
+  return points[index]
+}
+
+function getLoadProgress(load) {
+  if (!load.startTime || !load.totalJourneyHours) return 0
+
+  const start = new Date(load.startTime)
+  const now = new Date()
+  const totalMs = Number(load.totalJourneyHours) * 60 * 60 * 1000
+  const passedMs = now - start
+
+  let progress = passedMs / totalMs
+  if (progress < 0) progress = 0
+  if (progress > 1) progress = 1
+
+  return Math.round(progress * 100)
+}
+
+function createTruckIcon(label, color) {
+  return L.divIcon({
+    className: "custom-truck-icon",
+    html: `
+      <div class="truck-marker" style="--marker-color:${color}">
+        <div class="truck-dot">🚚</div>
+        <div class="truck-label">${label}</div>
+      </div>
+    `,
+    iconSize: [120, 40],
+    iconAnchor: [20, 20],
+  })
+}
+
+function RealMap({ routePoints, plannedMarker, loads = [] }) {
+  const activeLoads = loads.filter(
+    (load) =>
+      load.routePoints &&
+      load.routePoints.length >= 2 &&
+      load.status !== "Delivered"
+  )
+
+  const mapPoints =
+    activeLoads.length > 0
+      ? activeLoads.flatMap((l) => l.routePoints)
+      : routePoints
+
   const defaultCenter = [53.8, 23.8]
+
   const center =
-    routePoints.length > 0
-      ? routePoints[Math.floor(routePoints.length / 2)]
+    mapPoints.length > 0
+      ? mapPoints[Math.floor(mapPoints.length / 2)]
       : defaultCenter
 
   return (
     <div className="real-map">
       <MapContainer
         center={center}
-        zoom={routePoints.length ? 6 : 5}
+        zoom={mapPoints.length ? 6 : 5}
         scrollWheelZoom={true}
         className="leaflet-map"
-        key={routePoints.length ? `${center[0]}-${center[1]}-${plannedMarker ? "track" : "route"}` : "default"}
+        key={`${center[0]}-${center[1]}-${activeLoads.length}-${routePoints.length}-${loads.length}`}
       >
         <TileLayer
           attribution="&copy; OpenStreetMap contributors"
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
-        {routePoints.length >= 2 && (
+        {activeLoads.length > 0 ? (
+          activeLoads.map((load, index) => {
+            const color = COLORS[index % COLORS.length]
+            const point = getProgressPoint(load.routePoints, load)
+            const label = load.truck || load.id
+
+            return (
+              <div key={load.id}>
+                <Polyline positions={load.routePoints} pathOptions={{ color, weight: 5 }} />
+
+                {point && (
+                  <Marker position={point} icon={createTruckIcon(label, color)}>
+                    <Popup>
+                      <strong>{load.id}</strong>
+                      <br />
+                      {load.driver}
+                      <br />
+                      {load.truck}
+                      <br />
+                      {load.status}
+                      <br />
+                      Progress: {getLoadProgress(load)}%
+                    </Popup>
+                  </Marker>
+                )}
+              </div>
+            )
+          })
+        ) : (
           <>
-            <Polyline
-              positions={routePoints}
-              pathOptions={{ color: "#1578c8", weight: 5 }}
-            />
+            {routePoints.length >= 2 && (
+              <>
+                <Polyline positions={routePoints} pathOptions={{ color: "#1578c8", weight: 5 }} />
 
-            <Marker position={routePoints[0]}>
-              <Popup>Start</Popup>
-            </Marker>
+                <Marker position={routePoints[0]}>
+                  <Popup>Start</Popup>
+                </Marker>
 
-            <Marker position={routePoints[routePoints.length - 1]}>
-              <Popup>Destination</Popup>
-            </Marker>
+                <Marker position={routePoints[routePoints.length - 1]}>
+                  <Popup>Destination</Popup>
+                </Marker>
+              </>
+            )}
+
+            {plannedMarker && (
+              <CircleMarker
+                center={plannedMarker}
+                radius={12}
+                pathOptions={{
+                  color: "#ef4444",
+                  fillColor: "#ef4444",
+                  fillOpacity: 1,
+                }}
+              >
+                <Popup>Planned truck position</Popup>
+              </CircleMarker>
+            )}
           </>
-        )}
-
-        {plannedMarker && (
-          <CircleMarker
-            center={plannedMarker}
-            radius={12}
-            pathOptions={{
-              color: "#ef4444",
-              fillColor: "#ef4444",
-              fillOpacity: 1,
-            }}
-          >
-            <Popup>Planned truck position</Popup>
-          </CircleMarker>
         )}
       </MapContainer>
     </div>
@@ -141,6 +253,7 @@ function App() {
 
   const [newDriverName, setNewDriverName] = useState("")
   const [newDriverTruck, setNewDriverTruck] = useState("")
+
   const [newTruckPlate, setNewTruckPlate] = useState("")
   const [newTruckType, setNewTruckType] = useState("")
 
@@ -153,45 +266,49 @@ function App() {
   const [totalJourney, setTotalJourney] = useState(null)
   const [breaks, setBreaks] = useState(0)
   const [rests, setRests] = useState(0)
+  const [breakSchedule, setBreakSchedule] = useState([])
   const [routeStatus, setRouteStatus] = useState("Ready")
+
+  const [drivers, setDrivers] = useState([])
 
   const [loads, setLoads] = useState(() => {
     const saved = localStorage.getItem("transport_tms_loads")
     return saved ? JSON.parse(saved) : []
   })
 
-  const [drivers, setDrivers] = useState(() => {
-    const saved = localStorage.getItem("transport_tms_drivers")
-    return saved
-      ? JSON.parse(saved)
-      : [
-          { id: 1, name: "Mindaugas Petrauskas", truck: "Volvo FHH:433", status: "Available", stage: "Idle" },
-          { id: 2, name: "Jonas Petrauskas", truck: "Scania S:ABC123", status: "On Duty", stage: "In Transit" },
-          { id: 3, name: "Marius Kazlauskas", truck: "MAN TGX:KLM889", status: "On Duty", stage: "Loading" },
-        ]
-  })
-
   const [fleet, setFleet] = useState(() => {
     const saved = localStorage.getItem("transport_tms_fleet")
     return saved
       ? JSON.parse(saved)
-      : [
-          { truck: "Volvo FHH:433", type: "Volvo FH", status: "Available" },
-          { truck: "Scania S:ABC123", type: "Scania S", status: "Available" },
-        ]
+      : [{ truck: "Volvo FM430", type: "Volvo FM", status: "Available" }]
   })
+
+  useEffect(() => {
+    loadDrivers()
+  }, [])
 
   useEffect(() => {
     localStorage.setItem("transport_tms_loads", JSON.stringify(loads))
   }, [loads])
 
   useEffect(() => {
-    localStorage.setItem("transport_tms_drivers", JSON.stringify(drivers))
-  }, [drivers])
-
-  useEffect(() => {
     localStorage.setItem("transport_tms_fleet", JSON.stringify(fleet))
   }, [fleet])
+
+  async function loadDrivers() {
+    const { data, error } = await supabase
+      .from("drivers")
+      .select("*")
+      .order("created_at", { ascending: false })
+
+    if (error) {
+      console.log(error)
+      alert("Failed to load drivers from Supabase")
+      return
+    }
+
+    setDrivers(data || [])
+  }
 
   const menuItems = [
     { id: "dashboard", label: "Dashboard", icon: <Map size={18} /> },
@@ -201,6 +318,8 @@ function App() {
     { id: "loads", label: "Loads", icon: <Package size={18} /> },
     { id: "alerts", label: "Alerts", icon: <AlertTriangle size={18} /> },
   ]
+
+  const activeLoads = loads.filter((load) => load.status !== "Delivered")
 
   const alerts = loads
     .filter((load) => load.status !== "Delivered" && load.startTime)
@@ -215,8 +334,80 @@ function App() {
       severity: "danger",
     }))
 
+  const driverDailyLog = loads.map((load) => ({
+    driver: load.driver,
+    date: load.startTime ? new Date(load.startTime).toLocaleDateString() : "-",
+    loadId: load.id,
+    route: `${load.from} → ${load.to}`,
+    startTime: load.startTime || "-",
+    drivingTime: load.drivingTime,
+    totalJourney: load.totalJourney,
+    breaks: load.breaks,
+    rests: load.rests,
+    status: load.status,
+  }))
+
+  async function syncDriverByLoadStatus(load, status) {
+    let driverStatus = "Available"
+    let driverStage = "Idle"
+
+    if (status === "Loading") {
+      driverStatus = "On Duty"
+      driverStage = "Loading"
+    }
+
+    if (status === "In Transit") {
+      driverStatus = "On Duty"
+      driverStage = "In Transit"
+    }
+
+    if (status === "Delayed") {
+      driverStatus = "On Duty"
+      driverStage = "In Transit"
+    }
+
+    if (status === "Delivered") {
+      driverStatus = "Available"
+      driverStage = "Completed"
+    }
+
+    const driverRecord = drivers.find((d) => d.name === load.driver)
+
+    if (!driverRecord) return
+
+    const { error } = await supabase
+      .from("drivers")
+      .update({
+        status: driverStatus,
+        current_stage: driverStage,
+      })
+      .eq("id", driverRecord.id)
+
+    if (error) {
+      console.log(error)
+      return
+    }
+
+    loadDrivers()
+  }
+
+  function updateLoadStatus(id, status) {
+    const load = loads.find((l) => l.id === id)
+
+    setLoads((prev) =>
+      prev.map((l) => (l.id === id ? { ...l, status } : l))
+    )
+
+    if (load) syncDriverByLoadStatus(load, status)
+  }
+
   function getInitials(name) {
-    return name.split(" ").map((p) => p[0]).join("").slice(0, 2).toUpperCase()
+    return name
+      ?.split(" ")
+      .map((p) => p[0])
+      .join("")
+      .slice(0, 2)
+      .toUpperCase()
   }
 
   function getAvatarClass(index) {
@@ -247,6 +438,15 @@ function App() {
     if (stage === "Rest") return "stage-rest"
     if (stage === "Completed") return "stage-completed"
     return "stage-idle"
+  }
+
+  function getLoadStatusClass(status) {
+    if (status === "Planned") return "load-status planned"
+    if (status === "Loading") return "load-status loading"
+    if (status === "In Transit") return "load-status transit"
+    if (status === "Delayed") return "load-status delayed"
+    if (status === "Delivered") return "load-status delivered"
+    return "load-status"
   }
 
   async function geocodeLocation(input) {
@@ -313,6 +513,7 @@ function App() {
       setTotalJourney(journey.total)
       setBreaks(journey.breaks)
       setRests(journey.rests)
+      setBreakSchedule(journey.breakSchedule)
       setRouteStatus("Ready")
     } catch (error) {
       console.log(error)
@@ -322,23 +523,29 @@ function App() {
   }
 
   async function trackLoad(load) {
-    const route = await getRoute(load.from, load.to)
+    let points = load.routePoints
 
-    if (!route) {
-      alert("Unable to track this load route")
-      return
+    if (!points || points.length < 2) {
+      const route = await getRoute(load.from, load.to)
+
+      if (!route) {
+        alert("Unable to track this load route")
+        return
+      }
+
+      points = route.geometry.coordinates.map((coord) => [coord[1], coord[0]])
     }
 
-    const points = route.geometry.coordinates.map((coord) => [coord[1], coord[0]])
     setRoutePoints(points)
+    setPlannedMarker(getProgressPoint(points, load))
 
     if (!load.startTime || !load.totalJourneyHours) {
-      setPlannedMarker(points[0])
       setTrackingInfo({
         status: "No tracking data",
         progress: 0,
         delayed: false,
       })
+
       setActivePage("dashboard")
       return
     }
@@ -351,9 +558,6 @@ function App() {
     let progress = passedMs / totalMs
     if (progress < 0) progress = 0
     if (progress > 1) progress = 1
-
-    const index = Math.floor(progress * (points.length - 1))
-    setPlannedMarker(points[index])
 
     let status = "On route"
     let delayed = false
@@ -380,7 +584,7 @@ function App() {
       return
     }
 
-    if (!distance || !drivingTime || !totalJourney) {
+    if (!distance || !drivingTime || !totalJourney || routePoints.length < 2) {
       alert("Calculate route before saving")
       return
     }
@@ -400,6 +604,8 @@ function App() {
       totalJourneyHours: totalJourney?.toFixed(2),
       breaks,
       rests,
+      breakSchedule,
+      routePoints,
     }
 
     setLoads((prev) => [newLoad, ...prev])
@@ -409,27 +615,77 @@ function App() {
     setTruck("")
   }
 
-  function addDriver() {
+  async function addDriver() {
     if (!newDriverName || !newDriverTruck) return
 
-    setDrivers((prev) => [
-      { id: Date.now(), name: newDriverName, truck: newDriverTruck, status: "Available", stage: "Idle" },
-      ...prev,
+    const { error } = await supabase.from("drivers").insert([
+      {
+        name: newDriverName,
+        truck: newDriverTruck,
+        status: "Available",
+        current_stage: "Idle",
+      },
     ])
+
+    if (error) {
+      console.log(error)
+      alert("Failed to add driver")
+      return
+    }
 
     setNewDriverName("")
     setNewDriverTruck("")
+    loadDrivers()
   }
 
-  function deleteDriver(id) {
-    setDrivers((prev) => prev.filter((d) => d.id !== id))
+  async function deleteDriver(id) {
+    const { error } = await supabase.from("drivers").delete().eq("id", id)
+
+    if (error) {
+      console.log(error)
+      alert("Failed to delete driver")
+      return
+    }
+
+    loadDrivers()
+  }
+
+  async function updateDriverStatus(id, status) {
+    const { error } = await supabase.from("drivers").update({ status }).eq("id", id)
+
+    if (error) {
+      console.log(error)
+      alert("Failed to update driver status")
+      return
+    }
+
+    loadDrivers()
+  }
+
+  async function updateDriverStage(id, current_stage) {
+    const { error } = await supabase
+      .from("drivers")
+      .update({ current_stage })
+      .eq("id", id)
+
+    if (error) {
+      console.log(error)
+      alert("Failed to update driver stage")
+      return
+    }
+
+    loadDrivers()
   }
 
   function addTruck() {
     if (!newTruckPlate || !newTruckType) return
 
     setFleet((prev) => [
-      { truck: newTruckPlate, type: newTruckType, status: "Available" },
+      {
+        truck: newTruckPlate,
+        type: newTruckType,
+        status: "Available",
+      },
       ...prev,
     ])
 
@@ -492,7 +748,7 @@ function App() {
     return (
       <>
         <section className="stats">
-          <div className="stat-card"><span>Active Loads</span><strong>{loads.length}</strong></div>
+          <div className="stat-card"><span>Active Loads</span><strong>{activeLoads.length}</strong></div>
           <div className="stat-card"><span>Drivers</span><strong>{drivers.length}</strong></div>
           <div className="stat-card"><span>Fleet</span><strong>{fleet.length}</strong></div>
           <div className="stat-card"><span>Alerts</span><strong>{alerts.length}</strong></div>
@@ -502,10 +758,10 @@ function App() {
           <div className="panel">
             <div className="panel-header">
               <h3>Live Map</h3>
-              <span>{trackingInfo ? "Tracking selected load" : "Route visualization"}</span>
+              <span>{activeLoads.length > 0 ? "Live active loads overview" : "Route visualization"}</span>
             </div>
 
-            <RealMap routePoints={routePoints} plannedMarker={plannedMarker} />
+            <RealMap routePoints={routePoints} plannedMarker={plannedMarker} loads={loads} />
 
             {trackingInfo && (
               <div className="tracking-info">
@@ -522,14 +778,48 @@ function App() {
             )}
           </div>
 
-          <div className="panel">
+          <div className="panel active-loads-panel">
             <div className="panel-header">
-              <h3>Quick Planner</h3>
-              <span>Create and save loads</span>
+              <h3>Active Loads</h3>
+              <span>{activeLoads.length} live loads</span>
             </div>
 
-            {renderPlannerForm()}
+            <div className="active-loads-list">
+              {activeLoads.map((load, index) => (
+                <button
+                  className="active-load-item"
+                  key={load.id}
+                  onClick={() => trackLoad(load)}
+                  style={{ borderLeftColor: COLORS[index % COLORS.length] }}
+                >
+                  <div>
+                    <strong>{load.id}</strong>
+                    <span>{load.from} → {load.to}</span>
+                  </div>
+
+                  <div>
+                    <strong>{load.driver}</strong>
+                    <span>{load.truck}</span>
+                  </div>
+
+                  <span className={getLoadStatusClass(load.status)}>{load.status}</span>
+                </button>
+              ))}
+
+              {activeLoads.length === 0 && (
+                <div className="empty-alerts">No active loads yet.</div>
+              )}
+            </div>
           </div>
+        </section>
+
+        <section className="panel dashboard-planner-panel">
+          <div className="panel-header">
+            <h3>Quick Planner</h3>
+            <span>Create and save loads</span>
+          </div>
+
+          {renderPlannerForm()}
         </section>
       </>
     )
@@ -537,28 +827,58 @@ function App() {
 
   function renderRoutes() {
     return (
-      <div className="panel">
-        <div className="panel-header">
-          <h3>Routes</h3>
-          <span>Real route calculation</span>
-        </div>
-
-        <div style={{ marginBottom: 20 }}>{renderPlannerForm()}</div>
-
-        <div className="routes-layout">
-          <div>
-            <RealMap routePoints={routePoints} plannedMarker={plannedMarker} />
+      <>
+        <div className="panel">
+          <div className="panel-header">
+            <h3>Routes</h3>
+            <span>Real route calculation</span>
           </div>
 
-          <div className="route-side">
-            <div className="mini-card"><strong>Status</strong><span>{routeStatus}</span></div>
-            <div className="mini-card"><strong>Distance</strong><span>{distance ? `${distance} km` : "--"}</span></div>
-            <div className="mini-card"><strong>Driving</strong><span>{drivingTime ? formatHours(drivingTime) : "--"}</span></div>
-            <div className="mini-card"><strong>Total Journey</strong><span>{totalJourney ? formatHours(totalJourney) : "--"}</span></div>
-            <div className="mini-card"><strong>Breaks / Rests</strong><span>{breaks} / {rests}</span></div>
+          <div style={{ marginBottom: 20 }}>{renderPlannerForm()}</div>
+
+          <div className="routes-layout">
+            <div>
+              <RealMap routePoints={routePoints} plannedMarker={plannedMarker} />
+            </div>
+
+            <div className="route-side">
+              <div className="mini-card"><strong>Status</strong><span>{routeStatus}</span></div>
+              <div className="mini-card"><strong>Distance</strong><span>{distance ? `${distance} km` : "--"}</span></div>
+              <div className="mini-card"><strong>Driving</strong><span>{drivingTime ? formatHours(drivingTime) : "--"}</span></div>
+              <div className="mini-card"><strong>Total Journey</strong><span>{totalJourney ? formatHours(totalJourney) : "--"}</span></div>
+              <div className="mini-card"><strong>Breaks / Rests</strong><span>{breaks} / {rests}</span></div>
+            </div>
           </div>
         </div>
-      </div>
+
+        <div className="panel break-panel">
+          <div className="panel-header">
+            <h3>Break Schedule</h3>
+            <span>Driver break and rest planning</span>
+          </div>
+
+          {breakSchedule.length === 0 ? (
+            <div className="empty-alerts">Calculate a route to see break schedule.</div>
+          ) : (
+            <div className="break-list">
+              {breakSchedule.map((item, index) => (
+                <div className="break-item" key={index}>
+                  <div className={item.type === "Break" ? "break-icon" : "rest-icon"}>
+                    {item.type === "Break" ? <Coffee size={18} /> : <Bed size={18} />}
+                  </div>
+
+                  <div>
+                    <strong>{item.type}</strong>
+                    <span>{item.text}</span>
+                  </div>
+
+                  <em>{formatHours(item.duration)}</em>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </>
     )
   }
 
@@ -568,7 +888,7 @@ function App() {
         <div className="panel drivers-panel">
           <div className="panel-header">
             <h3>Drivers</h3>
-            <span>Driver registry</span>
+            <span>Supabase synced driver registry</span>
           </div>
 
           <div className="driver-form">
@@ -612,13 +932,7 @@ function App() {
                   <select
                     className={`status-pill ${getStatusClass(driverObj.status)}`}
                     value={driverObj.status}
-                    onChange={(e) =>
-                      setDrivers((prev) =>
-                        prev.map((d) =>
-                          d.id === driverObj.id ? { ...d, status: e.target.value } : d
-                        )
-                      )
-                    }
+                    onChange={(e) => updateDriverStatus(driverObj.id, e.target.value)}
                   >
                     <option>Available</option>
                     <option>On Duty</option>
@@ -628,18 +942,12 @@ function App() {
                 </span>
 
                 <span>
-                  <div className={`stage-select-wrap ${getStageClass(driverObj.stage || "Idle")}`}>
-                    <StageIcon stage={driverObj.stage || "Idle"} />
+                  <div className={`stage-select-wrap ${getStageClass(driverObj.current_stage || "Idle")}`}>
+                    <StageIcon stage={driverObj.current_stage || "Idle"} />
 
                     <select
-                      value={driverObj.stage || "Idle"}
-                      onChange={(e) =>
-                        setDrivers((prev) =>
-                          prev.map((d) =>
-                            d.id === driverObj.id ? { ...d, stage: e.target.value } : d
-                          )
-                        )
-                      }
+                      value={driverObj.current_stage || "Idle"}
+                      onChange={(e) => updateDriverStage(driverObj.id, e.target.value)}
                     >
                       <option>Idle</option>
                       <option>Loading</option>
@@ -661,6 +969,41 @@ function App() {
 
           <div className="driver-footer">
             Showing 1 to {drivers.length} of {drivers.length} drivers
+          </div>
+        </div>
+
+        <div className="panel stage-legend-panel">
+          <div className="panel-header">
+            <h3>Driver Daily Work Log</h3>
+            <span>Loads by driver and day</span>
+          </div>
+
+          <div className="daily-log-table">
+            <div className="daily-log-header">
+              <span>Date</span>
+              <span>Driver</span>
+              <span>Load</span>
+              <span>Route</span>
+              <span>Driving</span>
+              <span>Total</span>
+              <span>Status</span>
+            </div>
+
+            {driverDailyLog.map((item, index) => (
+              <div className="daily-log-row" key={index}>
+                <span>{item.date}</span>
+                <span>{item.driver}</span>
+                <span>{item.loadId}</span>
+                <span>{item.route}</span>
+                <span>{item.drivingTime}</span>
+                <span>{item.totalJourney}</span>
+                <span className={getLoadStatusClass(item.status)}>{item.status}</span>
+              </div>
+            ))}
+
+            {driverDailyLog.length === 0 && (
+              <div className="empty-alerts">No driver work history yet.</div>
+            )}
           </div>
         </div>
 
@@ -725,61 +1068,89 @@ function App() {
   }
 
   function renderLoads() {
+    const delivered = loads.filter((l) => l.status === "Delivered").length
+    const transit = loads.filter((l) => l.status === "In Transit").length
+    const delayed = loads.filter((l) => l.status === "Delayed").length
+
     return (
-      <div className="panel">
-        <div className="panel-header">
-          <h3>Loads</h3>
-          <span>Saved load management</span>
-        </div>
+      <>
+        <section className="stats">
+          <div className="stat-card"><span>Total Loads</span><strong>{loads.length}</strong></div>
+          <div className="stat-card"><span>In Transit</span><strong>{transit}</strong></div>
+          <div className="stat-card"><span>Delivered</span><strong>{delivered}</strong></div>
+          <div className="stat-card"><span>Delayed</span><strong>{delayed}</strong></div>
+        </section>
 
-        <div className="loads-grid">
-          {loads.map((load) => (
-            <div className="load-card" key={load.id}>
-              <div className="load-top">
-                <strong>{load.id}</strong>
-                <span>{load.status}</span>
-              </div>
+        <div className="panel">
+          <div className="panel-header">
+            <h3>Load Management</h3>
+            <span>Professional dispatch overview</span>
+          </div>
 
-              <p><b>{load.customer}</b></p>
-              <p>{load.from} → {load.to}</p>
-              <p>{load.driver} • {load.truck}</p>
-
-              <div className="load-info">
-                <div><Clock size={14} />{load.drivingTime}</div>
-                <div><Route size={14} />{load.totalJourney}</div>
-              </div>
-
-              <p>{load.distance}</p>
-
-              <div className="status-actions">
-                <button className="track-btn" onClick={() => trackLoad(load)}>
-                  <LocateFixed size={14} />
-                  Track
-                </button>
-
-                {["Planned", "Loading", "In Transit", "Delayed", "Delivered"].map((status) => (
-                  <button
-                    key={status}
-                    onClick={() =>
-                      setLoads((prev) =>
-                        prev.map((l) => (l.id === load.id ? { ...l, status } : l))
-                      )
-                    }
-                    className={load.status === status ? "status-active" : ""}
-                  >
-                    {status}
-                  </button>
-                ))}
-
-                <button className="delete-load-btn" onClick={() => deleteLoad(load.id)}>
-                  <Trash2 size={14} />
-                  Delete
-                </button>
-              </div>
+          <div className="loads-table">
+            <div className="loads-table-header">
+              <span>Load</span>
+              <span>Route</span>
+              <span>Driver</span>
+              <span>Truck</span>
+              <span>ETA</span>
+              <span>Status</span>
+              <span>Actions</span>
             </div>
-          ))}
+
+            {loads.map((load) => (
+              <div className="loads-table-row" key={load.id}>
+                <div className="load-main">
+                  <strong>{load.id}</strong>
+                  <small>{load.customer}</small>
+                </div>
+
+                <div className="route-cell">
+                  <strong>{load.from}</strong>
+                  <span>→</span>
+                  <strong>{load.to}</strong>
+                </div>
+
+                <div>{load.driver}</div>
+                <div>{load.truck}</div>
+
+                <div className="eta-cell">
+                  <Clock size={14} />
+                  {load.totalJourney}
+                </div>
+
+                <div>
+                  <span className={getLoadStatusClass(load.status)}>{load.status}</span>
+                </div>
+
+                <div className="load-actions">
+                  <button className="track-btn" onClick={() => trackLoad(load)}>
+                    <LocateFixed size={14} />
+                    Track
+                  </button>
+
+                  <select
+                    className="load-status-select"
+                    value={load.status}
+                    onChange={(e) => updateLoadStatus(load.id, e.target.value)}
+                  >
+                    <option>Planned</option>
+                    <option>Loading</option>
+                    <option>In Transit</option>
+                    <option>Delayed</option>
+                    <option>Delivered</option>
+                  </select>
+
+                  <button className="delete-load-btn" onClick={() => deleteLoad(load.id)}>
+                    <Trash2 size={14} />
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      </>
     )
   }
 
