@@ -16,6 +16,39 @@ import "./App.css"
 
 const COLORS = ["#2563eb", "#16a34a", "#f97316", "#7c3aed", "#dc2626", "#0891b2"]
 
+const DRIVER_WORKFLOWS = [
+  {
+    label: "Idle",
+    status: "Available",
+    stage: "Idle",
+  },
+  {
+    label: "Loading",
+    status: "On Duty",
+    stage: "Loading",
+  },
+  {
+    label: "Driving",
+    status: "On Duty",
+    stage: "In Transit",
+  },
+  {
+    label: "Break",
+    status: "Break",
+    stage: "Break",
+  },
+  {
+    label: "Rest",
+    status: "Break",
+    stage: "Rest",
+  },
+  {
+    label: "Finished",
+    status: "Available",
+    stage: "Completed",
+  },
+]
+
 function formatHours(hours) {
   const totalMinutes = Math.round(Number(hours || 0) * 60)
   const h = Math.floor(totalMinutes / 60)
@@ -125,6 +158,46 @@ function getLoadProgress(load) {
   if (progress > 1) progress = 1
 
   return Math.round(progress * 100)
+}
+
+function getEtaText(load) {
+  if (!load.startTime || !load.totalJourneyHours) return "No ETA"
+
+  const start = new Date(load.startTime)
+  const now = new Date()
+  const totalMs = Number(load.totalJourneyHours) * 60 * 60 * 1000
+  const arrival = new Date(start.getTime() + totalMs)
+  const remainingMs = arrival - now
+
+  if (remainingMs <= 0) return "ETA passed"
+
+  const totalMinutes = Math.ceil(remainingMs / 60000)
+  const h = Math.floor(totalMinutes / 60)
+  const m = totalMinutes % 60
+
+  return `${h}h ${m}min left`
+}
+
+function getArrivalText(load) {
+  if (!load.startTime || !load.totalJourneyHours) return "-"
+
+  const start = new Date(load.startTime)
+  const totalMs = Number(load.totalJourneyHours) * 60 * 60 * 1000
+  const arrival = new Date(start.getTime() + totalMs)
+
+  return arrival.toLocaleString()
+}
+
+function getLiveLoadStatus(load) {
+  const progress = getLoadProgress(load)
+
+  if (load.status === "Delivered") return "Delivered"
+  if (progress >= 100) return "Should be arrived"
+  if (load.status === "Loading") return "Loading"
+  if (load.status === "In Transit") return "In Transit"
+  if (load.status === "Delayed") return "Delayed"
+
+  return load.status || "Planned"
 }
 
 function createTruckIcon(label, color) {
@@ -268,6 +341,8 @@ function App() {
   const [rests, setRests] = useState(0)
   const [breakSchedule, setBreakSchedule] = useState([])
   const [routeStatus, setRouteStatus] = useState("Ready")
+  const [liveTick, setLiveTick] = useState(Date.now())
+  const [activityFeed, setActivityFeed] = useState([])
 
   const [drivers, setDrivers] = useState([])
 
@@ -285,6 +360,14 @@ function App() {
 
   useEffect(() => {
     loadDrivers()
+  }, [])
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setLiveTick(Date.now())
+    }, 1000)
+
+    return () => clearInterval(interval)
   }, [])
 
   useEffect(() => {
@@ -323,16 +406,32 @@ function App() {
 
   const alerts = loads
     .filter((load) => load.status !== "Delivered" && load.startTime)
-    .filter((load) => {
+    .flatMap((load) => {
       const arrival = new Date(load.startTime)
       arrival.setHours(arrival.getHours() + Number(load.totalJourneyHours || 0))
-      return new Date() > arrival
+
+      const result = []
+
+      if (new Date() > arrival) {
+        result.push({
+          type: "Delay Risk",
+          text: `${load.id} should already be arrived.`,
+          severity: "danger",
+        })
+      }
+
+      const progress = getLoadProgress(load)
+
+      if (progress > 80 && load.status !== "Delivered") {
+        result.push({
+          type: "Approaching destination",
+          text: `${load.id} is close to destination.`,
+          severity: "warning",
+        })
+      }
+
+      return result
     })
-    .map((load) => ({
-      type: "Delay Risk",
-      text: `${load.id} should already be arrived.`,
-      severity: "danger",
-    }))
 
   const driverDailyLog = loads.map((load) => ({
     driver: load.driver,
@@ -346,6 +445,17 @@ function App() {
     rests: load.rests,
     status: load.status,
   }))
+
+  function addActivity(type, text) {
+    const item = {
+      id: `${Date.now()}-${Math.random()}`,
+      type,
+      text,
+      time: new Date().toLocaleTimeString(),
+    }
+
+    setActivityFeed((prev) => [item, ...prev].slice(0, 8))
+  }
 
   async function syncDriverByLoadStatus(load, status) {
     let driverStatus = "Available"
@@ -398,7 +508,10 @@ function App() {
       prev.map((l) => (l.id === id ? { ...l, status } : l))
     )
 
-    if (load) syncDriverByLoadStatus(load, status)
+    if (load) {
+      syncDriverByLoadStatus(load, status)
+      addActivity(status, `${load.id} changed to ${status}`)
+    }
   }
 
   function getInitials(name) {
@@ -597,7 +710,7 @@ function App() {
       from: startLocation,
       to: endLocation,
       startTime,
-      status: "Planned",
+      status: "Loading",
       distance: `${distance} km`,
       drivingTime: formatHours(drivingTime),
       totalJourney: formatHours(totalJourney),
@@ -609,6 +722,31 @@ function App() {
     }
 
     setLoads((prev) => [newLoad, ...prev])
+    syncDriverByLoadStatus(newLoad, "Loading")
+    addActivity("Created", `${newLoad.id} created and set to Loading`)
+
+    setTimeout(() => {
+      setLoads((prev) =>
+        prev.map((load) =>
+          load.id === newLoad.id ? { ...load, status: "In Transit" } : load
+        )
+      )
+      syncDriverByLoadStatus(newLoad, "In Transit")
+      addActivity("In Transit", `${newLoad.id} started driving`)
+    }, 10000)
+
+    const totalMs = Math.max(Number(newLoad.totalJourneyHours || 0) * 60 * 60 * 1000, 15000)
+
+    setTimeout(() => {
+      setLoads((prev) =>
+        prev.map((load) =>
+          load.id === newLoad.id ? { ...load, status: "Delivered" } : load
+        )
+      )
+      syncDriverByLoadStatus(newLoad, "Delivered")
+      addActivity("Delivered", `${newLoad.id} marked as delivered`)
+    }, totalMs)
+
     setLoadId("")
     setCustomer("")
     setDriver("")
@@ -671,6 +809,24 @@ function App() {
     if (error) {
       console.log(error)
       alert("Failed to update driver stage")
+      return
+    }
+
+    loadDrivers()
+  }
+
+  async function updateDriverWorkflow(id, status, current_stage) {
+    const { error } = await supabase
+      .from("drivers")
+      .update({
+        status,
+        current_stage,
+      })
+      .eq("id", id)
+
+    if (error) {
+      console.log(error)
+      alert("Failed to update driver workflow")
       return
     }
 
@@ -745,6 +901,8 @@ function App() {
   }
 
   function renderDashboard() {
+    const _liveRefresh = liveTick
+
     return (
       <>
         <section className="stats">
@@ -800,9 +958,20 @@ function App() {
                   <div>
                     <strong>{load.driver}</strong>
                     <span>{load.truck}</span>
+
+                    <div className="mini-progress">
+                      <div
+                        className="mini-progress-bar"
+                        style={{ width: `${getLoadProgress(load)}%` }}
+                      />
+                    </div>
+
+                    <small>{getLoadProgress(load)}% • {getEtaText(load)}</small>
                   </div>
 
-                  <span className={getLoadStatusClass(load.status)}>{load.status}</span>
+                  <span className={getLoadStatusClass(load.status)}>
+                    {getLiveLoadStatus(load)}
+                  </span>
                 </button>
               ))}
 
@@ -810,6 +979,30 @@ function App() {
                 <div className="empty-alerts">No active loads yet.</div>
               )}
             </div>
+          </div>
+        </section>
+
+        <section className="panel activity-panel">
+          <div className="panel-header">
+            <h3>Dispatcher Activity</h3>
+            <span>Live workflow timeline</span>
+          </div>
+
+          <div className="activity-feed">
+            {activityFeed.length === 0 && (
+              <div className="empty-alerts">No activity yet.</div>
+            )}
+
+            {activityFeed.map((item) => (
+              <div className="activity-item" key={item.id}>
+                <div className="activity-dot" />
+                <div>
+                  <strong>{item.type}</strong>
+                  <span>{item.text}</span>
+                </div>
+                <em>{item.time}</em>
+              </div>
+            ))}
           </div>
         </section>
 
@@ -959,10 +1152,31 @@ function App() {
                   </div>
                 </span>
 
-                <button className="driver-delete-btn" onClick={() => deleteDriver(driverObj.id)}>
-                  <Trash2 size={16} />
-                  Delete
-                </button>
+                <div className="driver-actions">
+                  <div className="workflow-buttons">
+                    {DRIVER_WORKFLOWS.map((workflow) => (
+                      <button
+                        key={workflow.label}
+                        type="button"
+                        className={`workflow-btn ${getStageClass(workflow.stage)}`}
+                        onClick={() =>
+                          updateDriverWorkflow(
+                            driverObj.id,
+                            workflow.status,
+                            workflow.stage
+                          )
+                        }
+                      >
+                        {workflow.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <button className="driver-delete-btn" onClick={() => deleteDriver(driverObj.id)}>
+                    <Trash2 size={16} />
+                    Delete
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -1114,9 +1328,13 @@ function App() {
                 <div>{load.driver}</div>
                 <div>{load.truck}</div>
 
-                <div className="eta-cell">
-                  <Clock size={14} />
-                  {load.totalJourney}
+                <div className="eta-cell eta-stack">
+                  <div>
+                    <Clock size={14} />
+                    {load.totalJourney}
+                  </div>
+                  <small>{getEtaText(load)}</small>
+                  <small>Arrives: {getArrivalText(load)}</small>
                 </div>
 
                 <div>
